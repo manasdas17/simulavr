@@ -1,0 +1,26 @@
+# files to ignore by git
+
+# files created by configure
+config.texi
+conf.py
+
+# files created by make
+doc_build
+web_build
+doxygen-doc
+simulavr.info
+simulavr.pdf
+simulavr.html
+*.aux
+*.cp
+*.cps
+*.fn
+*.ky
+*.log
+*.pg
+*.toc
+*.tp
+*.vr
+
+# files created by make
+stamp-vti

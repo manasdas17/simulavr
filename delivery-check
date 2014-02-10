@@ -1,0 +1,308 @@
+#!/bin/bash
+
+# check and load preferences file
+if [ ! -f "delivery-check.conf" ]; then
+  echo "error: file 'delivery-check.conf' not found"
+  echo "  Please copy delivery-check.conf.sample to delivery-check.conf,"
+  echo "  edit it to YOUR preferences and start again!"
+  exit 2
+fi
+source delivery-check.conf
+SHOW_COMMIT_MAX=20
+if [ ! -z "$CONF_SHOW_COMMIT_MAX" ]; then
+  SHOW_COMMIT_MAX=$CONF_SHOW_COMMIT_MAX
+fi
+
+function printHelp() {
+  cat <<EOD
+$1 [opt] [sel-commit]
+
+opts are:
+  -h     print help
+  -d     disable dist check
+  -t     disable build/install tcl module (if configured!)
+  -v     disable build/install verilog module (if configured!)
+  -y     disable build/install doxygen doc (because it needs time to build)
+  -x     build also sphinx and web docu (usefull combined with -n to not to delete it after creating!)
+  -c     removes workarea, if exist, without question. Be carefull!
+  -s     shows last $SHOW_COMMIT_MAX commits (for selecting a commit to check) 
+
+sel-commit: commit to use, it resets cloned repo to the selected number of commits BACK to find errors.
+         See option -s for available commits! If this parameter isn't given, HEAD revision is used for check.
+EOD
+}
+
+function processArgs() {
+  PRGNAME=$0
+  OPT_TCL=y
+  OPT_VERILOG=y
+  OPT_DIST=y
+  OPT_DOXY=y
+  OPT_SPHINX=n
+  OPT_CLEANWA=n
+  OPT_SHOWCOMMIT=n
+  while true; do
+    getopts "htdvyxcs" OPT
+    if [ $OPT = "?" ]; then
+      shift $((--OPTIND))
+      SCRIPT_ARGS=$*
+      break
+    elif [ $OPT = "t" ]; then
+      OPT_TCL=n
+    elif [ $OPT = "d" ]; then
+      OPT_DIST=n
+    elif [ $OPT = "v" ]; then
+      OPT_VERILOG=n
+    elif [ $OPT = "y" ]; then
+      OPT_DOXY=n
+    elif [ $OPT = "x" ]; then
+      OPT_SPHINX=y
+    elif [ $OPT = "c" ]; then
+      OPT_CLEANWA=y
+    elif [ $OPT = "s" ]; then
+      OPT_SHOWCOMMIT=y
+    elif [ $OPT = "h" ]; then
+      printHelp $PRGNAME
+      exit 0
+    fi
+  done
+}
+
+function error() {
+  echo "error: $1"
+  if [ -z "$2" ]; then
+    RES="1"
+  else
+    RES=$2
+  fi
+  exit $RES
+}
+
+function runAndTest() {
+  if [ -z "$3" ]; then
+    LOG_NAME=`echo "$2" | sed "s/ /_/g"`
+  else
+    LOG_NAME=$3
+  fi
+  LOG=$HOME_DIR/log/$LOG_NAME.log
+  echo "[$LOG_NAME]" >> $LOG_CONFIG
+  echo "log=$LOG" >> $LOG_CONFIG
+  TMP=`mktemp`
+  echo "cmd=$1" >> $LOG_CONFIG
+  date "+start=%Y/%m/%d/%H/%M/%S" >> $LOG_CONFIG
+  ($1 2>&1; echo $? >> $TMP) | tee $LOG
+  date "+end=%Y/%m/%d/%H/%M/%S" >> $LOG_CONFIG
+  RES=`cat $TMP`
+  echo "result=$RES" >> $LOG_CONFIG
+  echo "" >> $LOG_CONFIG
+  LOG_STEPS="$LOG_STEPS $LOG_NAME"
+  rm -f $TMP
+  if [ ! $RES = 0 ]; then
+    writehtml $LOG_NAME
+    error "'$2' finished with exit code not equal 0 ($RES)" 3
+  fi
+}
+
+function runConfCmd() {
+  C="./configure --prefix=/usr"
+  if [ ! -z "$CONF_BFD_PATH" ]; then
+    C="$C --with-bfd=$CONF_BFD_PATH"
+  fi
+  if [ "$OPT_TCL" = "y" -a "$CONF_WITH_TCL" = "y" -a ! -z "$CONF_TCL_CONFIG" ]; then
+    C="$C --with-tclconfig=$CONF_TCL_CONFIG"
+  fi
+  if [ ! -z "$CONF_GTEST_PATH" -a -d "$CONF_GTEST_PATH" ]; then
+    C="$C --with-gtest=$CONF_GTEST_PATH"
+  fi
+  C="$C --enable-python"
+  if [ "$OPT_DOXY" = "y" -a "$CONF_WITH_DOXYGEN" = "y" ]; then
+    C="$C --enable-doxygen-doc"
+  fi
+  if [ "$OPT_VERILOG" = "y" -a "$CONF_WITH_VERILOG" = "y" ]; then
+    C="$C --enable-verilog"
+  fi
+  if [ ! -z "$CONF_PYTHON_LDFLAGS" ]; then
+    PARAM_PYTHON_LDFLAGS="PYTHON_LDFLAGS=\"$CONF_PYTHON_LDFLAGS\""
+  fi
+  if [ ! -z "$CONF_EXTRA_LIBS" ]; then
+    PARAM_EXTRA_LIBS="EXTRA_LIBS=\"$CONF_EXTRA_LIBS\""
+  fi
+  TMP=`mktemp`
+  LOG=$HOME_DIR/log/$1.log
+  echo "[$1]" >> $LOG_CONFIG
+  echo "log=$LOG" >> $LOG_CONFIG
+  echo "cmd=$C $PARAM_PYTHON_LDFLAGS $PARAM_EXTRA_LIBS" >> $LOG_CONFIG
+  date "+start=%Y/%m/%d/%H/%M/%S" >> $LOG_CONFIG
+  ($C $PARAM_PYTHON_LDFLAGS $PARAM_EXTRA_LIBS 2>&1; echo $? >> $TMP) | tee $LOG
+  date "+end=%Y/%m/%d/%H/%M/%S" >> $LOG_CONFIG
+  RES=`cat $TMP`
+  echo "result=$RES" >> $LOG_CONFIG
+  echo "" >> $LOG_CONFIG
+  LOG_STEPS="$LOG_STEPS $1"
+  rm -f $TMP
+  if [ ! $RES = 0 ]; then
+    writehtml "$1"
+    error "run 'configure' failed" 4
+  fi
+}
+
+function writehtml() {
+  # get status and date/title of last commit
+  pushd $HOME_DIR/repo > /dev/null
+  git status -s > $HOME_DIR/log/status.log
+  git log -1 > $HOME_DIR/log/commit.log
+  popd > /dev/null
+  # write global data
+  echo "[global]" >> $LOG_CONFIG
+  echo "output=$HOME_DIR/log" >> $LOG_CONFIG
+  echo "repo-work=$HOME_DIR/repo" >> $LOG_CONFIG
+  echo "repo=$CONF_REPO_URL" >> $LOG_CONFIG
+  echo "branch=$CONF_REPO_BRANCH" >> $LOG_CONFIG
+  echo "start=$LOG_DATE_START" >> $LOG_CONFIG
+  date "+end=%Y/%m/%d/%H/%M/%S" >> $LOG_CONFIG
+  echo "steps=clone$LOG_STEPS" >> $LOG_CONFIG  
+  echo "opt-tcl=$OPT_TCL" >> $LOG_CONFIG  
+  echo "opt-dist=$OPT_DIST" >> $LOG_CONFIG  
+  echo "opt-verilog=$OPT_VERILOG" >> $LOG_CONFIG  
+  echo "opt-sphinx=$OPT_SPHINX" >> $LOG_CONFIG  
+  echo "opt-doxy=$OPT_DOXY" >> $LOG_CONFIG  
+  echo "conf-tcl=$CONF_WITH_TCL" >> $LOG_CONFIG  
+  echo "conf-doxy=$CONF_WITH_DOXYGEN" >> $LOG_CONFIG  
+  echo "conf-verilog=$CONF_WITH_VERILOG" >> $LOG_CONFIG  
+  echo "status-repo=$HOME_DIR/log/status.log" >> $LOG_CONFIG
+  echo "commit-repo=$HOME_DIR/log/commit.log" >> $LOG_CONFIG
+  if [ "$1" == "ok" ]; then
+    echo "result=success" >> $LOG_CONFIG
+  else
+    echo "result=failed" >> $LOG_CONFIG
+    echo "failed-step=$1" >> $LOG_CONFIG
+  fi
+  echo "" >> $LOG_CONFIG
+  echo "[clone]" >> $LOG_CONFIG
+  echo "start=$LOG_DATE_START" >> $LOG_CONFIG
+  echo "end=$LOG_DATE_CLONE" >> $LOG_CONFIG
+  echo "cmd=$LOG_CMD_CLONE" >> $LOG_CONFIG
+  echo "log=$HOME_DIR/log/clone.log" >> $LOG_CONFIG
+  echo "" >> $LOG_CONFIG
+  # if python exists, create html files
+  C=`which python`
+  if [ ! -z "$C" ]; then
+    $C $HOME_DIR/repo/doc/log2html.py $LOG_CONFIG
+    R=$?
+    # if xdg-open exists, open browser
+    C=`which xdg-open`
+    if [ ! -z "$C" -a $R == 0 ]; then
+      $C $HOME_DIR/log/index.html
+    fi
+  fi
+}
+
+# check preferences settings, set HOME_DIR
+test -z "$CONF_CHECK_PATH" && error "CONF_CHECK_PATH not set!"
+HOME_DIR=$CONF_CHECK_PATH
+test -z "$CONF_REPO_URL" && error "CONF_REPO_URL not set!"
+test -z "$CONF_REPO_BRANCH" && error "CONF_REPO_BRANCH not set!"
+
+# process args
+processArgs $*
+
+# delete workarea, if exists
+if [ -f $HOME_DIR -o -d $HOME_DIR ]; then
+  echo "Workarea path: '$HOME_DIR'"
+  if [ "$OPT_CLEANWA" == "y" ]; then
+    rm -rf $HOME_DIR
+  else
+    read -p "Workarea exists! Remove workarea? [Ny] " Q
+    if [ "$Q" == "y" ]; then
+      rm -rf $HOME_DIR
+    else
+      error "workarea not removed" 2
+    fi
+  fi
+fi
+
+# create workarea
+test -f $HOME_DIR -o -d $HOME_DIR && error "$HOME_DIR exists! Reconfigure preferences or rename/delete path before." 2
+mkdir -p $HOME_DIR/repo $HOME_DIR/inst $HOME_DIR/dist $HOME_DIR/log
+
+# start date and time
+LOG_DATE_START=`date "+%Y/%m/%d/%H/%M/%S"`
+LOG_CONFIG=$HOME_DIR/log/log.cfg
+LOG_STEPS=""
+
+# clone repository
+echo "clone repository ..."
+pushd $HOME_DIR > /dev/null
+git clone $CONF_REPO_URL -b $CONF_REPO_BRANCH repo 2>&1 | tee $HOME_DIR/log/clone.log
+popd > /dev/null
+LOG_DATE_CLONE=`date "+%Y/%m/%d/%H/%M/%S"`
+LOG_CMD_CLONE="git clone $CONF_REPO_URL -b $CONF_REPO_BRANCH repo"
+
+# show commits, if selected and stop
+if [ "$OPT_SHOWCOMMIT" == "y" ]; then
+  pushd $HOME_DIR/repo > /dev/null
+  git log --format=oneline | head -$SHOW_COMMIT_MAX | nl
+  popd > /dev/null
+  rm -rf $HOME_DIR
+  exit 0
+fi
+
+# reset workarea to selected commit
+SELCOMMITNR=`echo $SCRIPT_ARGS | awk '/^[1-9][0-9]?$$/{print $0}'`
+if [ ! -z "$SELCOMMITNR" ]; then
+  pushd $HOME_DIR/repo > /dev/null
+  SELCOMMIT=`git log --format=oneline | head -$SELCOMMITNR | tail -1 | cut "-d " -f1`
+  git reset --hard $SELCOMMIT >> $HOME_DIR/log/clone.log
+  popd > /dev/null
+fi
+
+# start build run and check run
+pushd $HOME_DIR/repo > /dev/null
+echo "run bootstrap and configure ..."
+runAndTest "./bootstrap" "bootstrap"
+runConfCmd "configure"
+echo "run make, make check and make dist ..."
+runAndTest "make" "make"
+runAndTest "make check" "make check" "check"
+if [ "$OPT_DOXY" = "y" -a "$CONF_WITH_DOXYGEN" = "y" ]; then
+  runAndTest "make doxygen-doc" "make doxygen-doc" "doxygen"
+fi
+if [ "$OPT_SPHINX" = "y" ]; then
+  runAndTest "make sphinx-doc" "make sphinx-doc" "sphinx"
+  runAndTest "make web-html" "make web-html" "sphinx-web"
+fi
+runAndTest "make dist" "make dist" "dist"
+echo "run make install ..."
+runAndTest "make DESTDIR=$HOME_DIR/inst install" "make install" "install"
+runAndTest "make DESTDIR=$HOME_DIR/inst install-info" "make install-info" "install-info"
+runAndTest "make DESTDIR=$HOME_DIR/inst install-pdf" "make install-pdf" "install-pdf"
+runAndTest "make DESTDIR=$HOME_DIR/inst install-html" "make install-html" "install-html"
+if [ "$OPT_DOXY" = "y" -a "$CONF_WITH_DOXYGEN" = "y" ]; then
+  runAndTest "make DESTDIR=$HOME_DIR/inst install-doxygen" "make install-doxygen" "install-doxy"
+fi
+if [ "$OPT_VERILOG" = "y" -a "$CONF_WITH_VERILOG" = "y" ]; then
+  runAndTest "make DESTDIR=$HOME_DIR/inst install-vpi" "make install-vpi" "install-vpi"
+fi
+popd > /dev/null
+
+# check dist package
+if [ "$OPT_DIST" = "y" ]; then
+  pushd $HOME_DIR/dist > /dev/null
+  tar xzf ../repo/simulavr-*.tar.gz
+  pushd simulavr* > /dev/null
+  echo "dist: run bootstrap and configure ..."
+  runAndTest "./bootstrap" "bootstrap" "dist-bootstrap"
+  runConfCmd "dist-configure"
+  echo "dist: run make, make check and make dist ..."
+  runAndTest "make" "make" "dist-make"
+  runAndTest "make check" "make check" "dist-check"
+  runAndTest "make dist" "make dist" "dist-dist"
+  popd > /dev/null
+  popd > /dev/null
+fi
+
+writehtml "ok"
+echo "****** successfull *******"
+exit 0
+
+# EOF
